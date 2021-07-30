@@ -25,6 +25,18 @@ class UnityEnvWrapper:
         self.action_size = self.brain.vector_action_space_size
         self.state_size = self.env_info.vector_observations.shape[1]
 
+    def __enter__(self):
+        """
+        Returns context-manager instance.
+        """
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """
+        Closes the context-manager.
+        """
+        self.close()
+
     def reset(self, train_mode: bool = True) -> np.ndarray:
         """
         Resets the environment.
@@ -35,18 +47,18 @@ class UnityEnvWrapper:
         self.env_info = self.env.reset(train_mode)[self.brain_name]
         return self.env_info.vector_observations
 
-    def step(self, action: UnityAction) -> Tuple[np.array, float, bool]:
+    def step(self, actions: UnityAction) -> Tuple[np.array, np.array, np.array]:
         """
         Perform given action in the environment.
 
         :param action: action step.
         :return: (next_state, reward, done) tuple.
         """
-        env_info = self.env.step(action)[self.brain_name]
+        env_info = self.env.step(actions)[self.brain_name]
         next_state = env_info.vector_observations
-        reward = env_info.rewards[0]
-        done = env_info.local_done[0]
-        return next_state, reward, done
+        rewards = env_info.rewards
+        dones = env_info.local_done
+        return next_state, np.array(rewards), np.array(dones)
 
     def close(self) -> None:
         """

@@ -1,6 +1,6 @@
 import random
 from collections import deque
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 from dataclasses import dataclass
 
 import torch
@@ -18,11 +18,11 @@ class Experience:
     Experience data of an agent.
     """
 
-    state: np.ndarray
-    action: int
-    reward: float
-    next_state: np.ndarray
-    done: bool
+    states: np.ndarray
+    actions: np.ndarray
+    rewards: np.ndarray
+    next_states: np.ndarray
+    dones: np.ndarray
 
 
 class ReplayBuffer:
@@ -54,22 +54,22 @@ class ReplayBuffer:
 
     def add(
         self,
-        state: np.ndarray,
-        action: int,
-        reward: float,
-        next_state: np.ndarray,
-        done: bool,
+        states: np.ndarray,
+        actions: np.ndarray,
+        rewards: np.ndarray,
+        next_states: np.ndarray,
+        dones: np.ndarray,
     ) -> None:
         """
         Adds new experience to the internal memory.
 
-        :param state: current state of the environment.
-        :param action: action taken.
-        :param reward: reward received for given action.
-        :param next_state: next state after taken the given action.
-        :param done: indicates if episode has finished.
+        :param states: current states of the environment.
+        :param actions: actions taken.
+        :param rewards: rewards received for given action.
+        :param next_states: next states after taken the given action.
+        :param dones: indicates if episode has finished.
         """
-        self.memory.append(Experience(state, action, reward, next_state, done))
+        self.memory.append(Experience(states, actions, rewards, next_states, dones))
 
     def sample(
         self,
@@ -82,36 +82,40 @@ class ReplayBuffer:
         experiences = random.sample(self.memory, k=self.batch_size)
 
         states = (
-            torch.from_numpy(np.vstack([e.state for e in experiences if e is not None]))
+            torch.from_numpy(
+                np.vstack([e.states.flatten() for e in experiences if e is not None])
+            )
             .float()
             .to(self.device)
         )
         actions = (
             torch.from_numpy(
-                np.vstack([e.action for e in experiences if e is not None])
+                np.vstack([e.actions.flatten() for e in experiences if e is not None])
             )
             .float()
             .to(self.device)
         )
         rewards = (
             torch.from_numpy(
-                np.vstack([e.reward for e in experiences if e is not None])
+                np.vstack([e.rewards.flatten() for e in experiences if e is not None])
             )
             .float()
             .to(self.device)
         )
         next_states = (
             torch.from_numpy(
-                np.vstack([e.next_state for e in experiences if e is not None])
+                np.vstack(
+                    [e.next_states.flatten() for e in experiences if e is not None]
+                )
             )
             .float()
             .to(self.device)
         )
         dones = (
             torch.from_numpy(
-                np.vstack([e.done for e in experiences if e is not None]).astype(
-                    np.uint8
-                )
+                np.vstack(
+                    [e.dones.flatten() for e in experiences if e is not None]
+                ).astype(np.uint8)
             )
             .float()
             .to(self.device)
