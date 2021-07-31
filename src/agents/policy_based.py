@@ -198,10 +198,10 @@ class MADDPG:
     def _step(
         self,
         states: np.ndarray,
-        actions: List[float],
+        actions: List[np.ndarray],
         rewards: np.ndarray,
         next_states: np.ndarray,
-        dones: bool,
+        dones: np.ndarray,
     ) -> None:
         """
         Adds the experience to memory and fits the agent.
@@ -219,45 +219,41 @@ class MADDPG:
             len(self.memory) > self.batch_size
             and (self.step_count % self.update_every) == 0
         ):
-            experiences = self.memory.sample()
-            self._optimize(experiences)
+            self._optimize()
 
-    def _optimize(
-        self,
-        experiences: ExperienceBatch,
-    ) -> None:
+    def _optimize(self) -> None:
         """
         Updates value parameters using given batch of experience tuples.
-
-        :param experiences: tuple of (s, a, r, s', done) tuples.
         """
-        states, actions, rewards, next_states, dones = experiences
 
         for i, agent in enumerate(self.agents):
+            states, actions, rewards, next_states, dones = self.memory.sample()
+
             state_idx_start = self.state_size * i
             state_idx_end = state_idx_start + self.state_size
 
-            actor_state = states[:, state_idx_start:state_idx_end]
             actor_next_state = next_states[:, state_idx_start:state_idx_end]
-
             next_actions = torch.cat(
                 [a.actor_target(actor_next_state) for a in self.agents], 1
             )
             next_q = agent.critic_target(next_states, next_actions).detach()
-
             target_q = torch.mul(
                 torch.mul(rewards[:, i][:, None] + self.gamma, next_q),
                 1 - dones[:, i][:, None],
             )
             local_q = agent.critic_local(states, actions)
-            value_loss = agent.loss_fn(local_q, target_q)
 
+            value_loss = agent.loss_fn(local_q, target_q)
             agent.value_optimizer.zero_grad()
             value_loss.backward()
             agent.value_optimizer.step()
 
-            # actions = agent.actor_local(actor_state)
-            policy_loss = -agent.critic_local(states, actions).mean()
+            actor_state = states[:, state_idx_start:state_idx_end]
+            local_actions = actions
+            action_idx_start = self.action_size * i
+            actions_idx_end = action_idx_start + self.action_size
+            local_actions[:, action_idx_start:actions_idx_end] = agent.actor_local(actor_state)
+            policy_loss = -agent.critic_local(states, local_actions).mean()
 
             agent.policy_optimizer.zero_grad()
             policy_loss.backward()
@@ -313,22 +309,18 @@ class MADDPG:
         eps = eps_start
         for i_episode in range(1, n_episodes + 1):
             states = environment.reset(train_mode=True)
-            score = 0
+            episode_scores = np.zeros(self.n_agents)
             for t in range(max_t):
-                actions = list(
-                    map(
-                        lambda x: x[0].act(x[1].reshape(-1, 1).T, eps),
-                        zip(self.agents, states),
-                    )
-                )
+                actions = self.act(states, eps)
                 next_states, rewards, dones = environment.step(actions)
                 self._step(states, actions, rewards, next_states, dones)
                 states = next_states
-                score += rewards  # TODO: shall we store mean or max here?
+                episode_scores += rewards
                 if any(dones):
                     break
-            scores_window.append(score)
-            scores.append(score)
+            episode_max_score = max(episode_scores)
+            scores_window.append(episode_max_score)
+            scores.append(episode_max_score)
             eps = max(eps_end, eps_decay * eps)
             average_score_window = float(np.mean(scores_window))
             self._log_progress(i_episode, average_score_window, scores_window_length)
@@ -341,6 +333,22 @@ class MADDPG:
                     self.save(agent_checkpoint_dir)
                 break
         return scores
+
+    def act(self, states: np.ndarray, eps: float = 0.0) -> List[np.ndarray]:
+        """
+        Computes actions for each agent based on given states of the environment.
+
+        :param states: current state.
+        :param eps: noise weighting coefficient.
+        :return: list of actions from all agents.
+        """
+        actions = list(
+            map(
+                lambda x: x[0].act(x[1].reshape(-1, 1).T, eps),
+                zip(self.agents, states),
+            )
+        )
+        return actions
 
     @staticmethod
     def _log_progress(

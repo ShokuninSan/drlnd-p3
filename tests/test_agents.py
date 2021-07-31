@@ -38,7 +38,6 @@ def test_random_agent():
 
 def test_maddpg_agent():
     num_agents = 2
-    action_size = 2
 
     agent = MADDPG(TEST_ENV.state_size, TEST_ENV.action_size, num_agents)
     agent.fit(
