@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 from copy import copy, deepcopy
 import os
+import pickle
+from glob import glob
+
 import numpy as np
 from collections import deque
 from typing import List, Optional, Tuple
-
 import torch
 import torch.optim as optim
 from torch.nn import SmoothL1Loss
@@ -13,8 +15,8 @@ from models.actor_critic import DeterministicPolicyNetwork, FullyConnectedQNetwo
 from experiences import ReplayBuffer, ExperienceBatch
 
 
-ACTOR_CHECKPOINT_FILENAME = "drlnd_p2_actor.pth"
-CRITIC_CHECKPOINT_FILENAME = "drlnd_p2_critic.pth"
+ACTOR_FN_PREFIX = "drlnd_p3_actor"
+CRITIC_FN_PREFIX = "drlnd_p3_critic"
 
 
 class DDPGAgent:
@@ -25,7 +27,7 @@ class DDPGAgent:
         critic_state_size: int,
         critic_action_size: int,
         actor_hidden_layer_dimensions: Tuple[int] = (256, 128),
-        critic_hidden_layer_dimensions: Tuple[int] = (256, 256, 128),
+        critic_hidden_layer_dimensions: Tuple[int] = (256, 128),
         lr_actor: float = 1e-3,
         lr_critic: float = 1e-3,
         seed: Optional[int] = None,
@@ -91,7 +93,7 @@ class DDPGAgent:
 
         self.loss_fn = SmoothL1Loss()
 
-    def act(self, state: np.ndarray, eps: float = 0.0) -> int:
+    def act(self, state: np.ndarray, eps: float = 0.0) -> np.ndarray:
         """
         Returns actions for given state as per current policy.
 
@@ -131,14 +133,15 @@ class MADDPG:
         state_size: int,
         action_size: int,
         n_agents: int,
-        actor_hidden_layer_dimensions: Tuple[int] = (256, 128),
-        critic_hidden_layer_dimensions: Tuple[int] = (256, 256, 128),
+        actor_hidden_layer_dimensions: Tuple[int] = (128, 64),
+        critic_hidden_layer_dimensions: Tuple[int] = (512, 256, 128),
         buffer_size: int = 1000_000,
-        batch_size: int = 128,
+        batch_size: int = 1024,
         gamma: float = 0.99,
-        tau: float = 1e-3,
-        lr_actor: float = 1e-3,
-        lr_critic: float = 1e-3,
+        tau: float = 0.1,
+        lr_actor: float = 1e-4,
+        lr_critic: float = 1e-4,
+        update_every: int = 2,
         seed: Optional[int] = None,
     ):
         """
@@ -155,11 +158,14 @@ class MADDPG:
         :param tau: interpolation parameter for target-network weight update.
         :param lr_actor: learning rate of the policy network.
         :param lr_critic: learning rate of the Q-network.
+        :param update_every: update every n steps.
         :param seed: random seed.
         """
         self.state_size = state_size
         self.action_size = action_size
         self.n_agents = n_agents
+        self.actor_hidden_layer_dimensions = actor_hidden_layer_dimensions
+        self.critic_hidden_layer_dimensions = critic_hidden_layer_dimensions
         self.buffer_size = buffer_size
         self.batch_size = batch_size
         self.gamma = gamma
@@ -173,27 +179,39 @@ class MADDPG:
 
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
+        self.memory = ReplayBuffer(
+            self.action_size, self.buffer_size, self.batch_size, self.seed
+        )
+
+        self.update_every = update_every
+        self.step_count = 0
+        self.agents: List[DDPGAgent]
+
+    def __getstate__(self):
+        state = self.__dict__
+        del state["agents"]
+        del state["device"]
+        del state["memory"]
+        return state
+
+    def _initialize_agents(self):
+        """
+        Initializes agents.
+        """
         self.agents = [
             DDPGAgent(
                 actor_state_size=self.state_size,
                 actor_action_size=self.action_size,
                 critic_state_size=self.state_size * self.n_agents,
                 critic_action_size=self.action_size * self.n_agents,
-                actor_hidden_layer_dimensions=actor_hidden_layer_dimensions,
-                critic_hidden_layer_dimensions=critic_hidden_layer_dimensions,
+                actor_hidden_layer_dimensions=self.actor_hidden_layer_dimensions,
+                critic_hidden_layer_dimensions=self.critic_hidden_layer_dimensions,
                 lr_actor=self.lr_actor,
                 lr_critic=self.lr_critic,
                 seed=self.seed,
             )
             for _ in range(self.n_agents)
         ]
-
-        self.memory = ReplayBuffer(
-            self.action_size, self.buffer_size, self.batch_size, self.seed
-        )
-
-        self.update_every = 4
-        self.step_count = 0
 
     def _step(
         self,
@@ -221,6 +239,18 @@ class MADDPG:
         ):
             self._optimize()
 
+    def _agent_states(self, agent_id: int, states: np.ndarray) -> np.ndarray:
+        """
+        Returns a single agents observation from a global observation.
+
+        :param agent_id: the agent's id.
+        :param states: global observations.
+        :return: a single agent's observation.
+        """
+        state_idx_start = self.state_size * agent_id
+        state_idx_end = state_idx_start + self.state_size
+        return states[:, state_idx_start:state_idx_end]
+
     def _optimize(self) -> None:
         """
         Updates value parameters using given batch of experience tuples.
@@ -229,17 +259,13 @@ class MADDPG:
         for i, agent in enumerate(self.agents):
             states, actions, rewards, next_states, dones = self.memory.sample()
 
-            state_idx_start = self.state_size * i
-            state_idx_end = state_idx_start + self.state_size
-
-            actor_next_state = next_states[:, state_idx_start:state_idx_end]
+            actor_next_state = self._agent_states(i, next_states)
             next_actions = torch.cat(
                 [a.actor_target(actor_next_state) for a in self.agents], 1
             )
             next_q = agent.critic_target(next_states, next_actions).detach()
-            target_q = torch.mul(
-                torch.mul(rewards[:, i][:, None] + self.gamma, next_q),
-                1 - dones[:, i][:, None],
+            target_q = rewards[:, i].view(-1, 1) + self.gamma * next_q * (
+                1 - dones[:, i].view(-1, 1)
             )
             local_q = agent.critic_local(states, actions)
 
@@ -248,11 +274,15 @@ class MADDPG:
             value_loss.backward()
             agent.value_optimizer.step()
 
-            actor_state = states[:, state_idx_start:state_idx_end]
-            local_actions = actions
-            action_idx_start = self.action_size * i
-            actions_idx_end = action_idx_start + self.action_size
-            local_actions[:, action_idx_start:actions_idx_end] = agent.actor_local(actor_state)
+            local_actions = []
+            for i, a in enumerate(self.agents):
+                local_states = self._agent_states(i, states)
+                local_actions.append(
+                    a.actor_local(local_states)
+                    if a == agent
+                    else a.actor_local(local_states).detach()
+                )
+            local_actions = torch.cat(local_actions, 1)
             policy_loss = -agent.critic_local(states, local_actions).mean()
 
             agent.policy_optimizer.zero_grad()
@@ -285,9 +315,9 @@ class MADDPG:
         max_t: int = 1000,
         eps_start: float = 1.0,
         eps_end: float = 0.01,
-        eps_decay: float = 0.995,
+        eps_decay: float = 0.999,
         scores_window_length: int = 100,
-        average_target_score: float = 30.0,
+        average_target_score: float = 0.5,
         agent_checkpoint_dir: Optional[str] = None,
     ) -> List[float]:
         """
@@ -304,6 +334,7 @@ class MADDPG:
         :param agent_checkpoint_dir: optional directory to store agent's model weights to.
         :return: list of scores.
         """
+        self._initialize_agents()
         scores = []
         scores_window = deque(maxlen=scores_window_length)
         eps = eps_start
@@ -323,7 +354,9 @@ class MADDPG:
             scores.append(episode_max_score)
             eps = max(eps_end, eps_decay * eps)
             average_score_window = float(np.mean(scores_window))
-            self._log_progress(i_episode, average_score_window, scores_window_length)
+            self._log_progress(
+                i_episode, average_score_window, scores_window_length, eps
+            )
             if np.mean(scores_window) >= average_target_score:
                 print(
                     f"\nEnvironment solved in {i_episode:d} episodes!\t"
@@ -342,17 +375,18 @@ class MADDPG:
         :param eps: noise weighting coefficient.
         :return: list of actions from all agents.
         """
-        actions = list(
-            map(
-                lambda x: x[0].act(x[1].reshape(-1, 1).T, eps),
-                zip(self.agents, states),
-            )
-        )
+        actions = [
+            agent.act(state.reshape(-1, 1).T, eps)
+            for agent, state in zip(self.agents, states)
+        ]
         return actions
 
     @staticmethod
     def _log_progress(
-        i_episode: int, average_score_window: float, scores_window_length: int
+        i_episode: int,
+        average_score_window: float,
+        scores_window_length: int,
+        eps: float,
     ) -> None:
         """
         Logs average score of episode to stdout.
@@ -360,42 +394,54 @@ class MADDPG:
         :param i_episode: number of current episode.
         :param average_score_window: average score of current episode.
         :param scores_window_length: length of window for computing the average.
+        :param eps: current epsilon.
         """
         print(
-            f"\rEpisode {i_episode}\tAverage Score: {average_score_window:.2f}",
+            f"\rEpisode {i_episode}\tAverage Score: {average_score_window:.2f}, Epsilon: {eps:.2f}",
             end="\n" if i_episode % scores_window_length == 0 else "",
         )
 
     def save(self, agent_checkpoint_dir: str) -> None:
         """
-        Stores the weights of the actor model.
+        Stores the weights of the agents and pickles the MADDPG instance.
 
         :param agent_checkpoint_dir: path to store agent's model weights to.
         """
-        actor_checkpoint_path = os.path.join(
-            agent_checkpoint_dir, ACTOR_CHECKPOINT_FILENAME
-        )
-        critic_checkpoint_path = os.path.join(
-            agent_checkpoint_dir, CRITIC_CHECKPOINT_FILENAME
-        )
+        for i, agent in enumerate(self.agents):
+            actor_checkpoint_path = os.path.join(
+                agent_checkpoint_dir, f"{ACTOR_FN_PREFIX}_{i}.pth"
+            )
+            critic_checkpoint_path = os.path.join(
+                agent_checkpoint_dir, f"{CRITIC_FN_PREFIX}_{i}.pth"
+            )
+            torch.save(agent.actor_local.state_dict(), actor_checkpoint_path)
+            torch.save(agent.critic_local.state_dict(), critic_checkpoint_path)
 
-        torch.save(self.actor_local.state_dict(), actor_checkpoint_path)
-        torch.save(self.critic_local.state_dict(), critic_checkpoint_path)
+        with open(os.path.join(agent_checkpoint_dir, f"maddpg.pkl"), "wb") as f:
+            pickle.dump(self, f)
 
     @staticmethod
-    def load(agent_checkpoint_dir: str) -> "DDPG":
+    def load(agent_checkpoint_dir: str) -> "MADDPG":
         """
-        Loads the stored actor's weights into the local model and creates a DDPG agent instance.
+        Loads the the pickled MADDPG agent instance.
 
         :param agent_checkpoint_dir: directory to load the actor model weights from.
         :return: a pre-trained agent instance.
         """
-        actor_checkpoint_path = os.path.join(
-            agent_checkpoint_dir, ACTOR_CHECKPOINT_FILENAME
-        )
-        state_dict = torch.load(actor_checkpoint_path)
-        state_size = list(state_dict.values())[0].shape[1]
-        action_size = list(state_dict.values())[-1].shape[0]
-        agent = MADDPG(state_size=state_size, action_size=action_size)
-        agent.actor_local.load_state_dict(state_dict)
-        return agent
+        with open(os.path.join(agent_checkpoint_dir, f"maddpg.pkl"), "rb") as f:
+            maddpg = pickle.load(f)
+            maddpg._initialize_agents()
+            for i, agent in enumerate(maddpg.agents):
+                actor_checkpoint_path = os.path.join(
+                    agent_checkpoint_dir, f"{ACTOR_FN_PREFIX}_{i}.pth"
+                )
+                actor_local_state = torch.load(actor_checkpoint_path)
+                agent.actor_local.load_state_dict(actor_local_state)
+
+                critic_checkpoint_path = os.path.join(
+                    agent_checkpoint_dir, f"{CRITIC_FN_PREFIX}_{i}.pth"
+                )
+                critic_local_state = torch.load(critic_checkpoint_path)
+                agent.critic_local.load_state_dict(critic_local_state)
+
+        return maddpg
