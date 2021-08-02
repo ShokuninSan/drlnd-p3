@@ -47,8 +47,6 @@ class DeterministicPolicyNetwork(nn.Module):
         self.hidden_layers = nn.ModuleList()
         for i in range(len(hidden_dims) - 1):
             self.hidden_layers.append(nn.Linear(hidden_dims[i], hidden_dims[i + 1]))
-            # if i == 0:
-            #     self.hidden_layers.append(nn.BatchNorm1d(hidden_dims[i + 1]))
         self.output_layer = nn.Linear(hidden_dims[-1], output_dim)
 
         self.activation_fn = activation_fn
@@ -112,7 +110,6 @@ class FullyConnectedQNetwork(nn.Module):
             if i == 0:
                 _input_dim += output_dim
                 self.hidden_layers.append(nn.Linear(_input_dim, hidden_dims[i + 1]))
-                # self.hidden_layers.append(nn.BatchNorm1d(hidden_dims[i + 1]))
             else:
                 self.hidden_layers.append(nn.Linear(_input_dim, hidden_dims[i + 1]))
 
